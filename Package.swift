@@ -16,8 +16,8 @@ let package = Package(
 		.target(name: "AudioEffectsSDKPackage", dependencies: ["AudioEffectsSDK"]),
 		.binaryTarget(
 			name: "AudioEffectsSDK", 
-			url: "https://github.com/EffectsSDK/audio-effects-sdk-swift-package/releases/download/1.6.0/AudioEffectsSDK.xcframework-1.6.0.112239.zip",
-			checksum: "d34c5e2fb58f9b3e8807e7feec0ae07c14807e923d5594856e0c90c7d4a29767"
+			url: "https://github.com/EffectsSDK/audio-effects-sdk-swift-package/releases/download/1.7.0/AudioEffectsSDK.xcframework-1.7.0.113272.zip",
+			checksum: "640222904d8f612c16f8f3facac53dfc6df136cb0aa28d6ebe162640449c6942"
 		)
 	]
 )
