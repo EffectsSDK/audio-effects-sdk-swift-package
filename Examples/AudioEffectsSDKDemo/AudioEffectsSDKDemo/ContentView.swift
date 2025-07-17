@@ -1,62 +1,26 @@
 
 import SwiftUI
 
-struct RecordItem : Identifiable {
-	let id: UUID
-	let name: String
-	let date: Date
-	let fileURL: URL
+func findCurrentUIWindow() -> UIWindow? {
+	let connectedScenes = UIApplication.shared.connectedScenes
+		.filter { scene in scene.activationState == .foregroundActive }
+		.compactMap { scene in scene as? UIWindowScene }
 	
-	var formattedDate: String {
-		let formatter = DateFormatter()
-		formatter.locale = Locale.current
-		formatter.dateStyle = .full
-		formatter.timeStyle = .full
-		return formatter.string(from: date)
-	}
-}
-
-func recordDir() -> URL {
-	return FileManager.default.urls(
-		for: .documentDirectory,
-		in: .userDomainMask
-	).first!.appendingPathComponent("records", conformingTo: .directory)
-}
-
-func loadRecordInfoFromFile(fileURL: URL) throws -> RecordItem
-{
-	let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-	let date = attrs[.creationDate] as! Date
-	
-	return RecordItem(
-		id:UUID(),
-		name: fileURL.deletingPathExtension().lastPathComponent,
-		date: date,
-		fileURL: fileURL
-	)
-}
-
-func loadRecordItems() -> [RecordItem] {
-	guard let files = try? FileManager.default.contentsOfDirectory(at: recordDir(), includingPropertiesForKeys: nil) else {
-		return []
-	}
-	var records = [RecordItem]()
-	for file in files {
-		do {
-			records.append(try loadRecordInfoFromFile(fileURL: file))
-		}
-		catch {}
-	}
-	return records
+	let window = connectedScenes.first?
+		.windows
+		.first { window in window.isKeyWindow }
+	return window
 }
 
 struct ContentView: View {
 	@ObservedObject var pipelineController: AudioPipelineController
-	@State var recordItems = loadRecordItems()
+	@ObservedObject var records: Records
 	@State var expandedRecord = UUID()
 	@State var isRenaming = false
 	@State var renamingFileName: String = ""
 	@State var renamingFileID = UUID()
+	@State var sampleRate = 48000
+	@State var audioFormat: AudioSampleFormat = .pcmInt16
 	
     var body: some View {
 		VStack(spacing: 0) {
@@ -97,14 +61,14 @@ struct ContentView: View {
 	func playlistItemContent(_ item: RecordItem) -> some View {
 		HStack {
 			VStack(alignment: .leading) {
-				Text(item.name).font(.title3)
+				Text(String(format: "[%@] %@", sampleRateName(item.sampleRate), item.name)).font(.title3)
 				Text(item.formattedDate).font(.caption2)
 			}.padding(.horizontal).padding(.bottom)
 			Spacer()
 			Menu {
 				Button {
 					try? FileManager.default.removeItem(at: item.fileURL)
-					recordItems.removeAll(where: { i in
+					records.items.removeAll(where: { i in
 						i.id == item.id
 					})
 				} label: {
@@ -116,6 +80,20 @@ struct ContentView: View {
 					isRenaming = true
 				} label: {
 					Text("Rename")
+				}
+				Button {
+					guard let vc = findCurrentUIWindow()?.rootViewController else {
+						return
+					}
+					let av = UIActivityViewController(activityItems: [item.fileURL], applicationActivities: nil)
+					if let popover = av.popoverPresentationController {
+						 popover.sourceView = vc.view
+						 popover.sourceRect = CGRect(x: vc.view.bounds.midX, y: vc.view.bounds.midY, width: 0, height: 0)
+						 popover.permittedArrowDirections = []
+					 }
+					vc.present(av, animated: true)
+				} label: {
+					Text("Share")
 				}
 			} label: {
 				Image(systemName:"line.3.horizontal")
@@ -137,7 +115,7 @@ struct ContentView: View {
 	}
 	
 	var playList: some View {
-		List(recordItems) { item in
+		List(records.items) { item in
 			Group {
 				if (expandedRecord == item.id) {
 					VStack{
@@ -154,7 +132,7 @@ struct ContentView: View {
 							} label: {
 								playlistItemButtonContent(isPlaying: isFilePlaying(fileURL: item.fileURL) && pipelineController.playingWithFilter, name: "DENOISE")
 							}.buttonStyle(PlainButtonStyle())
-						}
+						}.disabled(pipelineController.playingState == .starting)
 					}
 				}
 				else {
@@ -191,6 +169,7 @@ struct ContentView: View {
 		VStack {
 			playList.padding(.bottom)
 			HStack {
+				formatPicker.padding(.leading, 20)
 				Spacer()
 				Button(action: onRecordButton, label: {
 					rocordButtonContent.frame(width: 140)
@@ -245,9 +224,10 @@ struct ContentView: View {
 	
 	func onRecordButton()
 	{
+		let sampleRate = self.sampleRate
 		Task {
 			if (pipelineController.recordingState == .inactive) {
-				await pipelineController.startRecording()
+				await pipelineController.startRecording(sampleRate: sampleRate, format: audioFormat)
 				return
 			}
 			
@@ -267,9 +247,9 @@ struct ContentView: View {
 			let dstFileURL = fullFileURL(date: date, index: index)
 			do {
 				try FileManager.default.moveItem(at: recordedFileURL, to: dstFileURL)
-				let newItem = try loadRecordInfoFromFile(fileURL: dstFileURL)
+				let newItem = try await loadRecordInfoFromFile(fileURL: dstFileURL)
 				await MainActor.run {
-					self.recordItems.append(newItem)
+					self.records.items.append(newItem)
 				}
 			}
 			catch {	}
@@ -294,27 +274,35 @@ struct ContentView: View {
 	}
 	
 	func onPlayButton(fileURL: URL, withFilter: Bool) {
+		let filterOnly =
+			withFilter != pipelineController.playingWithFilter &&
+			pipelineController.mode == .playing &&
+			fileURL == pipelineController.playingFileURL
+		
+		if (filterOnly) {
+			pipelineController.playingWithFilter = withFilter
+			return
+		}
+		
+		let playNext = fileURL != pipelineController.playingFileURL
+		
 		Task {
-			let playNext = 
-				fileURL != pipelineController.playingFileURL ||
-				pipelineController.playingState == .inactive ||
-				pipelineController.playingWithFilter != withFilter
-			
 			await pipelineController.stopPlaying()
 			
 			if playNext {
-				await pipelineController.startPlaying(fileURL: fileURL, withFilter: withFilter)
+				await pipelineController.startPlaying(fileURL: fileURL, format: audioFormat)
 			}
 		}
+		pipelineController.playingWithFilter = withFilter
 	}
 	
 	func renameRecordFile(id: UUID, newName: String) -> Bool {
-		guard let recordIndex = recordItems.firstIndex(where: { i in
+		guard let recordIndex = records.items.firstIndex(where: { i in
 			i.id == id
 		}) else {
 			return false
 		}
-		let prevRecord = recordItems[recordIndex]
+		let prevRecord = records.items[recordIndex]
 		let recordDir = prevRecord.fileURL.deletingLastPathComponent()
 		let newFileURL = recordDir
 			.appendingPathComponent(newName)
@@ -335,11 +323,78 @@ struct ContentView: View {
 			id: prevRecord.id,
 			name: newName,
 			date: prevRecord.date,
-			fileURL: newFileURL
+			fileURL: newFileURL,
+			sampleRate: prevRecord.sampleRate
 		)
-		recordItems[recordIndex] = newRecord
+		records.items[recordIndex] = newRecord
 		
 		return true
+	}
+	
+	var formatPicker: some View {
+		HStack (spacing: 2) {
+				Button {
+					let currentIndex = sampleRates.firstIndex(of: sampleRate)!
+					let nextIndex = (currentIndex + 1) % sampleRates.count
+					sampleRate = sampleRates[nextIndex]
+				} label: {
+					Text(sampleRateName(presentedSampleRate))
+						.frame(minWidth: 65, minHeight: 45)
+				}
+				Button {
+					let currentIndex = AudioSampleFormat.allCases.firstIndex(of: audioFormat)!
+					let nextIndex = (currentIndex + 1) % AudioSampleFormat.allCases.count
+					audioFormat = AudioSampleFormat.allCases[nextIndex]
+				} label: {
+					Text(audioFormatName(presentedAudioFormat))
+						.frame(minWidth: 65, minHeight: 45)
+				}
+		}
+		.buttonStyle(.bordered)
+		.buttonBorderShape(.automatic)
+		.disabled(pipelineController.mode != .idle)
+	}
+	
+	func sampleRateName(_ rate: Int) -> String {
+		let khz = rate / 1000
+		let sub = (rate % 1000) / 100
+		if sub > 0 {
+			return "\(khz).\(sub)kHz"
+		}
+		return "\(khz)kHz"
+	}
+	
+	func audioFormatName(_ format: AudioSampleFormat) -> String {
+		switch(format) {
+		case .pcmInt16:
+			return "Int 16"
+		case .pcmFloat32:
+			return "Float 32"
+		case .pcmFloat32WebRTC:
+			return "Float 32 WebRTC"
+		}
+	}
+	
+	var presentedSampleRate: Int {
+		switch (pipelineController.mode) {
+		case .idle:
+			return self.sampleRate
+		case .playing:
+			return pipelineController.playingSampleRate
+		case .recording:
+			return pipelineController.recordingSampleRate
+		}
+	}
+	
+	var presentedAudioFormat: AudioSampleFormat {
+		switch (pipelineController.mode) {
+		case .idle:
+			return self.audioFormat
+		case .playing:
+			return pipelineController.playingFormat
+		case .recording:
+			return pipelineController.recordingFormat
+		}
 	}
 	
 	func convertState(_ state: PipelineState) -> String {
@@ -348,12 +403,16 @@ struct ContentView: View {
 		}
 		return "Initialization..."
 	}
+	
+	var sampleRates: [Int] {
+		return [16000, 24000, 32000, 44100, 48000]
+	}
 }
 
 #Preview {
-	ContentView(pipelineController: AudioPipelineController(), recordItems: [
-		RecordItem(id: UUID(), name: "Test name 1", date: Date.now, fileURL: URL(fileURLWithPath: "./stub.wav")),
-		RecordItem(id: UUID(), name: "Test name 2", date: Date.now, fileURL: URL(fileURLWithPath: "./stub.wav")),
-		RecordItem(id: UUID(), name: "Test name 3", date: Date.now, fileURL: URL(fileURLWithPath: "./stub.wav"))
-	])
+	ContentView(pipelineController: AudioPipelineController(), records: Records([
+		RecordItem(id: UUID(), name: "Test name 1", date: Date.now, fileURL: URL(fileURLWithPath: "./stub.wav"), sampleRate: 44100),
+		RecordItem(id: UUID(), name: "Test name 2", date: Date.now, fileURL: URL(fileURLWithPath: "./stub.wav"), sampleRate: 32000),
+		RecordItem(id: UUID(), name: "Test name 3", date: Date.now, fileURL: URL(fileURLWithPath: "./stub.wav"), sampleRate: 48000)
+	]))
 }
